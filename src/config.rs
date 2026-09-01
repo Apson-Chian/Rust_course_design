@@ -46,12 +46,15 @@ impl ServerConfig {
 pub struct ClientConfig {
     /// 服务器地址
     pub addr: String,
+    /// 可选的批处理命令文件；未指定时进入交互模式
+    pub command_file: Option<PathBuf>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1:7878".to_string(),
+            command_file: None,
         }
     }
 }
@@ -63,6 +66,9 @@ impl ClientConfig {
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--addr" => cfg.addr = it.next().ok_or("--addr 缺少参数")?,
+                "--file" => {
+                    cfg.command_file = Some(PathBuf::from(it.next().ok_or("--file 缺少参数")?))
+                }
                 "-h" | "--help" => return Err(Self::usage()),
                 other => return Err(format!("未知参数: {other}\n{}", Self::usage())),
             }
@@ -71,7 +77,7 @@ impl ClientConfig {
     }
 
     pub fn usage() -> String {
-        "用法: rkv-client [--addr 127.0.0.1:7878]".to_string()
+        "用法: rkv-client [--addr 127.0.0.1:7878] [--file commands.txt]".to_string()
     }
 }
 
@@ -93,5 +99,19 @@ mod tests {
     fn reject_unknown_arg() {
         assert!(ServerConfig::from_args(["--xxx".to_string()]).is_err());
         assert!(ServerConfig::from_args(["--addr".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_client_batch_file() {
+        let cfg = ClientConfig::from_args(
+            ["--addr", "127.0.0.1:9000", "--file", "commands.txt"].map(String::from),
+        )
+        .unwrap();
+        assert_eq!(cfg.addr, "127.0.0.1:9000");
+        assert_eq!(cfg.command_file, Some(PathBuf::from("commands.txt")));
+
+        let default = ClientConfig::default();
+        assert!(default.command_file.is_none());
+        assert!(ClientConfig::from_args(["--file".to_string()]).is_err());
     }
 }

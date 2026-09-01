@@ -18,3 +18,4 @@ pub mod server;
 pub mod store;
 
 pub use error::{Error, Result};
+pub mod d;

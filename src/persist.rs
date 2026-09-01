@@ -83,6 +83,18 @@ fn validate_recovered(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// 触发压缩的最小记录数，低于该值时压缩收益有限
+pub const COMPACT_MIN_RECORDS: u64 = 64;
+
+/// 日志文件统计信息
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogStats {
+    /// 文件中的记录条数（含被覆盖和删除的历史记录）
+    pub records: u64,
+    /// 文件字节数
+    pub bytes: u64,
+}
+
 /// 追加写日志文件
 #[derive(Debug)]
 pub struct AppendLog {
@@ -90,6 +102,8 @@ pub struct AppendLog {
     file: File,
     /// 已确认写入的字节数，用于追加失败时回滚半条记录
     size: u64,
+    /// 已确认写入的记录条数
+    records: u64,
 }
 
 impl AppendLog {
@@ -104,14 +118,22 @@ impl AppendLog {
                 fs::create_dir_all(dir)?;
             }
         }
-        let store = if path.exists() {
+        let (store, records) = if path.exists() {
             Self::replay(&path)?
         } else {
-            Store::new()
+            (Store::new(), 0)
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let size = file.metadata()?.len();
-        Ok((AppendLog { path, file, size }, store))
+        Ok((
+            AppendLog {
+                path,
+                file,
+                size,
+                records,
+            },
+            store,
+        ))
     }
 
     /// 修复被截断的数据文件：丢弃末尾那条不完整的记录，返回丢弃的字节数。
@@ -137,12 +159,13 @@ impl AppendLog {
         Ok(dropped)
     }
 
-    /// 按写入顺序重放全部记录，得到上次运行结束时的最终状态
-    fn replay(path: &Path) -> Result<Store> {
+    /// 按写入顺序重放全部记录，得到上次运行结束时的最终状态与记录条数
+    fn replay(path: &Path) -> Result<(Store, u64)> {
         let meta = fs::metadata(path)?;
         let mut store = Store::new();
         let reader = BufReader::new(File::open(path)?);
         let mut consumed: u64 = 0;
+        let mut records: u64 = 0;
         for (i, line) in reader.lines().enumerate() {
             let line = line.map_err(|e| Error::Corrupt(format!("第 {} 行读取失败: {e}", i + 1)))?;
             consumed += line.len() as u64 + 1; // +1 为换行符
@@ -161,6 +184,7 @@ impl AppendLog {
                     store.remove(&key);
                 }
             }
+            records += 1;
         }
         // 最后一行缺少换行符，说明上次写入中途被打断
         if consumed != meta.len() {
@@ -169,7 +193,7 @@ impl AppendLog {
                 path.display()
             )));
         }
-        Ok(store)
+        Ok((store, records))
     }
 
     /// 追加一条记录并立即落盘。
@@ -181,6 +205,7 @@ impl AppendLog {
         match self.write_line(&line) {
             Ok(()) => {
                 self.size += line.len() as u64;
+                self.records += 1;
                 Ok(())
             }
             Err(e) => {
@@ -205,11 +230,45 @@ impl AppendLog {
         }
     }
 
+    /// 当前日志文件的统计信息
+    pub fn stats(&self) -> LogStats {
+        LogStats {
+            records: self.records,
+            bytes: self.size,
+        }
+    }
+
+    /// 是否值得压缩：记录数达到下限，且历史冗余记录占到一半以上。
+    /// 只做判断不自动执行，压缩时机由调用方决定。
+    pub fn should_compact(&self, live_keys: usize) -> bool {
+        self.records >= COMPACT_MIN_RECORDS && self.records >= 2 * live_keys.max(1) as u64
+    }
+
     /// 日志压缩：用当前有效数据重写文件，丢弃历史覆盖与删除记录。
-    /// 先写临时文件再原子重命名，中途失败不会破坏原文件。返回压缩后的记录数。
+    /// 先写临时文件再原子重命名，中途失败会清理临时文件且不影响原文件。
+    /// 返回压缩后的记录数。
     pub fn compact(&mut self, store: &mut Store) -> Result<usize> {
         let tmp_path = self.path.with_extension("compact.tmp");
-        let mut tmp = File::create(&tmp_path)?;
+        let count = match Self::write_snapshot(&tmp_path, store) {
+            Ok(count) => count,
+            Err(e) => {
+                // 快照没写成功，原文件保持不变
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
+        fs::rename(&tmp_path, &self.path)?;
+        // 重命名本身也要落盘，否则崩溃后目录项可能仍指向旧文件
+        sync_parent_dir(&self.path);
+        self.file = OpenOptions::new().append(true).open(&self.path)?;
+        self.size = self.file.metadata()?.len();
+        self.records = count as u64;
+        Ok(count)
+    }
+
+    /// 把当前有效数据写入指定文件并落盘，返回记录数
+    fn write_snapshot(tmp_path: &Path, store: &mut Store) -> Result<usize> {
+        let mut tmp = File::create(tmp_path)?;
         let mut count = 0;
         for (key, entry) in store.iter_valid() {
             let record = Record::Set {
@@ -222,12 +281,25 @@ impl AppendLog {
         }
         tmp.flush()?;
         tmp.sync_data()?;
-        fs::rename(&tmp_path, &self.path)?;
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
-        self.size = self.file.metadata()?.len();
         Ok(count)
     }
 }
+
+/// 同步父目录，使重命名等目录项变更真正落盘。
+/// Windows 不允许以文件方式打开目录，因此仅在 unix 上执行。
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    if let Ok(f) = File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -421,5 +493,72 @@ mod tests {
         let (_log, mut restored) = AppendLog::open(&path).unwrap();
         assert_eq!(restored.get("k"), Some("4"));
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn stats_track_records_and_size() {
+        let path = tmp_path("stats");
+        let (mut log, mut store) = AppendLog::open(&path).unwrap();
+        assert_eq!(
+            log.stats(),
+            LogStats {
+                records: 0,
+                bytes: 0
+            }
+        );
+
+        for i in 0..COMPACT_MIN_RECORDS {
+            log.append(&Record::Set {
+                key: "k".into(),
+                value: i.to_string(),
+                expire_at_ms: None,
+            })
+            .unwrap();
+            store.set("k".into(), i.to_string(), None);
+        }
+        let stats = log.stats();
+        assert_eq!(stats.records, COMPACT_MIN_RECORDS);
+        assert_eq!(stats.bytes, fs::metadata(&path).unwrap().len());
+        assert!(log.should_compact(1)); // 64 条记录只对应 1 个有效键
+
+        log.compact(&mut store).unwrap();
+        assert_eq!(log.stats().records, 1);
+        assert!(!log.should_compact(1)); // 压缩后没有冗余
+
+        // 统计信息在重启后依然准确
+        let (reopened, _) = AppendLog::open(&path).unwrap();
+        assert_eq!(reopened.stats(), log.stats());
+    }
+
+    /// 压缩过程中无法创建临时文件时，原数据文件必须保持完好
+    #[test]
+    #[cfg(unix)]
+    fn compact_failure_keeps_original_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_path("compact-fail");
+        let (mut log, mut store) = AppendLog::open(&path).unwrap();
+        for i in 0..3 {
+            let value = i.to_string();
+            log.append(&Record::Set {
+                key: "k".into(),
+                value: value.clone(),
+                expire_at_ms: None,
+            })
+            .unwrap();
+            store.set("k".into(), value, None);
+        }
+        let before = fs::read_to_string(&path).unwrap();
+
+        // 去掉目录写权限，压缩时创建临时文件会失败
+        let dir = path.parent().unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = log.compact(&mut store);
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before); // 原文件未被破坏
+        let (_log, mut restored) = AppendLog::open(&path).unwrap();
+        assert_eq!(restored.get("k"), Some("2"));
     }
 }

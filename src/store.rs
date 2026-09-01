@@ -91,10 +91,35 @@ impl Store {
         self.map.iter()
     }
 
-    /// 清理所有已过期的记录
-    fn purge_expired(&mut self) {
+    /// 查询剩余存活时间：
+    /// - `None`：键不存在或已过期
+    /// - `Some(None)`：键存在且永不过期
+    /// - `Some(Some(ms))`：键存在，还剩 `ms` 毫秒
+    pub fn ttl_ms(&mut self, key: &str) -> Option<Option<u64>> {
         let now = now_ms();
+        if self.map.get(key).is_some_and(|e| e.is_expired(now)) {
+            self.map.remove(key);
+        }
+        self.map
+            .get(key)
+            .map(|e| e.expire_at_ms.map(|t| t.saturating_sub(now)))
+    }
+
+    /// 常驻条目数（含尚未被清理的过期项），供日志压缩阈值估算使用。
+    /// 与 [`Store::len`] 不同，本方法不触发清理，因此只需要不可变借用。
+    pub fn raw_len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// 主动清理所有已过期的记录，返回被清理的条数。
+    ///
+    /// 惰性删除只在访问时生效，长期不被访问的过期键会一直占用内存，
+    /// 因此对外暴露该方法，便于在压缩等时机集中回收。
+    pub fn purge_expired(&mut self) -> usize {
+        let now = now_ms();
+        let before = self.map.len();
         self.map.retain(|_, e| !e.is_expired(now));
+        before - self.map.len()
     }
 }
 
@@ -138,5 +163,33 @@ mod tests {
         assert_eq!(s.get("alive"), Some("v"));
         assert_eq!(s.keys(), vec!["alive"]);
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn ttl_reports_remaining_time() {
+        let mut s = Store::new();
+        s.set("forever".into(), "v".into(), None);
+        s.set("temp".into(), "v".into(), Some(now_ms() + 60_000));
+        s.set("gone".into(), "v".into(), Some(now_ms() - 1));
+
+        assert_eq!(s.ttl_ms("missing"), None); // 不存在
+        assert_eq!(s.ttl_ms("gone"), None); // 已过期等同不存在
+        assert_eq!(s.ttl_ms("forever"), Some(None)); // 永不过期
+        let remaining = s.ttl_ms("temp").unwrap().unwrap();
+        assert!(remaining > 59_000 && remaining <= 60_000);
+    }
+
+    #[test]
+    fn purge_expired_reclaims_untouched_keys() {
+        let mut s = Store::new();
+        s.set("a".into(), "v".into(), Some(now_ms() - 1));
+        s.set("b".into(), "v".into(), Some(now_ms() - 1));
+        s.set("c".into(), "v".into(), None);
+
+        // 过期键未被访问时仍占用内存
+        assert_eq!(s.raw_len(), 3);
+        assert_eq!(s.purge_expired(), 2);
+        assert_eq!(s.raw_len(), 1);
+        assert_eq!(s.purge_expired(), 0); // 重复清理无副作用
     }
 }

@@ -16,23 +16,37 @@ use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::protocol::{Command, Response, MAX_LINE};
 
+/// 默认允许的同时在线客户端数量。
+pub const DEFAULT_MAX_CLIENTS: usize = 64;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 服务器实例：持有监听套接字与共享的存储引擎
 pub struct Server {
     listener: TcpListener,
     engine: Arc<Mutex<Engine>>,
     /// 当前在线连接数，仅用于 STATS 展示
     clients: Arc<AtomicUsize>,
+    max_clients: usize,
 }
 
 impl Server {
     /// 恢复数据并绑定监听地址
     pub fn bind(cfg: &ServerConfig) -> Result<Server> {
+        Self::bind_with_max_clients(cfg, DEFAULT_MAX_CLIENTS)
+    }
+
+    /// 使用指定连接上限绑定服务器，主要供测试和嵌入式调用方使用。
+    pub fn bind_with_max_clients(cfg: &ServerConfig, max_clients: usize) -> Result<Server> {
+        if max_clients == 0 {
+            return Err(Error::Internal("最大连接数必须大于 0".into()));
+        }
         let engine = Engine::open(&cfg.data_file)?;
         let listener = TcpListener::bind(&cfg.addr)?;
         Ok(Server {
             listener,
             engine: Arc::new(Mutex::new(engine)),
             clients: Arc::new(AtomicUsize::new(0)),
+            max_clients,
         })
     }
 
@@ -53,7 +67,9 @@ impl Server {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(s) => {
-                    self.spawn_client(s);
+                    if let Err(e) = self.accept_client(s) {
+                        eprintln!("[rkv-server] 建立连接失败: {e}");
+                    }
                 }
                 Err(e) => eprintln!("[rkv-server] 接受连接失败: {e}"),
             }
@@ -75,7 +91,9 @@ impl Server {
                     // 部分平台会让 accept 出来的套接字继承监听器的非阻塞状态；
                     // 连接处理仍使用阻塞式 BufRead，因此这里显式恢复。
                     stream.set_nonblocking(false)?;
-                    workers.push(self.spawn_client(stream));
+                    if let Some(worker) = self.accept_client(stream)? {
+                        workers.push(worker);
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -92,15 +110,24 @@ impl Server {
         Ok(())
     }
 
-    fn spawn_client(&self, stream: TcpStream) -> thread::JoinHandle<()> {
+    fn accept_client(&self, mut stream: TcpStream) -> Result<Option<thread::JoinHandle<()>>> {
+        let Some(guard) = ClientGuard::try_acquire(Arc::clone(&self.clients), self.max_clients)
+        else {
+            stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
+            write_response(&mut stream, &Response::Err("服务器连接数已满".into()))?;
+            return Ok(None);
+        };
+
+        stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
         let engine = Arc::clone(&self.engine);
         let clients = Arc::clone(&self.clients);
         // 单个连接的错误被隔离在自己的线程内，不影响服务器与其他客户端
-        thread::spawn(move || {
-            if let Err(e) = handle_conn(stream, engine, clients) {
+        Ok(Some(thread::spawn(move || {
+            if let Err(e) = handle_conn(stream, engine, clients, guard) {
                 eprintln!("[rkv-server] 连接异常结束: {e}");
             }
-        })
+        })))
     }
 }
 
@@ -120,9 +147,14 @@ pub fn run(cfg: &ServerConfig) -> Result<()> {
 struct ClientGuard(Arc<AtomicUsize>);
 
 impl ClientGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        ClientGuard(counter)
+    /// 原子地检查连接上限并占用一个名额，避免多个接入线程同时越过上限。
+    fn try_acquire(counter: Arc<AtomicUsize>, max_clients: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                (current < max_clients).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| ClientGuard(counter))
     }
 }
 
@@ -137,9 +169,9 @@ fn handle_conn(
     stream: TcpStream,
     engine: Arc<Mutex<Engine>>,
     clients: Arc<AtomicUsize>,
+    _guard: ClientGuard,
 ) -> Result<()> {
     let peer = stream.peer_addr()?;
-    let _guard = ClientGuard::new(Arc::clone(&clients));
     println!("[rkv-server] 客户端接入: {peer}");
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -228,5 +260,100 @@ fn skip_rest_of_line<R: BufRead>(reader: &mut R) -> Result<()> {
         if n == 0 || junk.last() == Some(&b'\n') {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
+
+    fn tmp_file(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("rkv-server-{}-{}", name, std::process::id()))
+            .join("rkv.log")
+    }
+
+    fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+        for _ in 0..100 {
+            if counter.load(Ordering::SeqCst) == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "等待连接数变为 {expected} 超时，当前为 {}",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    fn request(stream: &mut TcpStream, line: &str) -> String {
+        writeln!(stream, "{line}").unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        response.trim_end().to_string()
+    }
+
+    #[test]
+    fn client_guard_enforces_limit_and_releases_slot() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = ClientGuard::try_acquire(Arc::clone(&counter), 2).unwrap();
+        let second = ClientGuard::try_acquire(Arc::clone(&counter), 2).unwrap();
+        assert!(ClientGuard::try_acquire(Arc::clone(&counter), 2).is_none());
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        drop(first);
+        let replacement = ClientGuard::try_acquire(Arc::clone(&counter), 2).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        drop(second);
+        drop(replacement);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn server_rejects_excess_connection_then_accepts_replacement() {
+        let cfg = ServerConfig {
+            addr: "127.0.0.1:0".into(),
+            data_file: tmp_file("connection-limit"),
+        };
+        let server = Server::bind_with_max_clients(&cfg, 1).unwrap();
+        let addr = server.local_addr().unwrap();
+        let clients = Arc::clone(&server.clients);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || server.serve_until(&server_shutdown).unwrap());
+
+        let mut first = TcpStream::connect(addr).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        wait_for_count(&clients, 1);
+        assert_eq!(request(&mut first, "PING"), "PONG");
+
+        let rejected = TcpStream::connect(addr).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut rejection = String::new();
+        BufReader::new(rejected).read_line(&mut rejection).unwrap();
+        assert_eq!(rejection.trim_end(), "ERR 服务器连接数已满");
+
+        drop(first);
+        wait_for_count(&clients, 0);
+
+        let mut replacement = TcpStream::connect(addr).unwrap();
+        replacement
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(request(&mut replacement, "PING"), "PONG");
+        assert_eq!(request(&mut replacement, "QUIT"), "BYE");
+        wait_for_count(&clients, 0);
+
+        shutdown.store(true, Ordering::Release);
+        worker.join().unwrap();
     }
 }

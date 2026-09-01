@@ -88,6 +88,8 @@ fn validate_recovered(key: &str, value: &str) -> Result<()> {
 pub struct AppendLog {
     path: PathBuf,
     file: File,
+    /// 已确认写入的字节数，用于追加失败时回滚半条记录
+    size: u64,
 }
 
 impl AppendLog {
@@ -108,7 +110,31 @@ impl AppendLog {
             Store::new()
         };
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok((AppendLog { path, file }, store))
+        let size = file.metadata()?.len();
+        Ok((AppendLog { path, file, size }, store))
+    }
+
+    /// 修复被截断的数据文件：丢弃末尾那条不完整的记录，返回丢弃的字节数。
+    ///
+    /// 进程在写日志中途崩溃会留下半行记录，此时 [`AppendLog::open`] 会拒绝启动。
+    /// 该方法提供显式的修复入口——只丢弃最后一个换行符之后的残留字节，
+    /// 已完整落盘的记录不受影响，避免自动修复掩盖真正的数据损坏。
+    pub fn repair_truncated<P: AsRef<Path>>(path: P) -> Result<u64> {
+        let path = path.as_ref();
+        // 课设规模下日志文件较小，一次性读入即可
+        let data = fs::read(path)?;
+        let keep = match data.iter().rposition(|b| *b == b'\n') {
+            Some(i) => i as u64 + 1,
+            None => 0, // 整个文件都是残留内容
+        };
+        let dropped = data.len() as u64 - keep;
+        if dropped == 0 {
+            return Ok(0);
+        }
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(keep)?;
+        file.sync_data()?;
+        Ok(dropped)
     }
 
     /// 按写入顺序重放全部记录，得到上次运行结束时的最终状态
@@ -146,12 +172,37 @@ impl AppendLog {
         Ok(store)
     }
 
-    /// 追加一条记录并立即落盘
+    /// 追加一条记录并立即落盘。
+    ///
+    /// 写入或落盘失败时，把文件回滚到本次写入前的长度，
+    /// 避免残留半条记录导致下次启动被判定为「文件损坏」。
     pub fn append(&mut self, record: &Record) -> Result<()> {
-        writeln!(self.file, "{}", record.encode())?;
+        let line = format!("{}\n", record.encode());
+        match self.write_line(&line) {
+            Ok(()) => {
+                self.size += line.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                self.rollback(self.size);
+                Err(e)
+            }
+        }
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<()> {
+        self.file.write_all(line.as_bytes())?;
         self.file.flush()?;
         self.file.sync_data()?;
         Ok(())
+    }
+
+    /// 把文件截断回指定长度；回滚本身失败时只告警，
+    /// 因为此时原始错误更重要，且下次启动仍会报出文件损坏
+    fn rollback(&mut self, len: u64) {
+        if let Err(e) = self.file.set_len(len).and_then(|_| self.file.sync_data()) {
+            eprintln!("[rkv-persist] 回滚未完成的写入失败: {e}");
+        }
     }
 
     /// 日志压缩：用当前有效数据重写文件，丢弃历史覆盖与删除记录。
@@ -173,6 +224,7 @@ impl AppendLog {
         tmp.sync_data()?;
         fs::rename(&tmp_path, &self.path)?;
         self.file = OpenOptions::new().append(true).open(&self.path)?;
+        self.size = self.file.metadata()?.len();
         Ok(count)
     }
 }
@@ -307,6 +359,48 @@ mod tests {
             AppendLog::open(&bad_value),
             Err(Error::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn partial_write_is_rolled_back() {
+        let path = tmp_path("rollback");
+        let (mut log, _store) = AppendLog::open(&path).unwrap();
+        log.append(&Record::Set {
+            key: "k".into(),
+            value: "v".into(),
+            expire_at_ms: None,
+        })
+        .unwrap();
+        let good_size = log.size;
+
+        // 模拟写入过程中崩溃：只落了半条记录
+        log.file.write_all(b"SET\tk2\t-\tpar").unwrap();
+        log.file.flush().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > good_size);
+
+        log.rollback(good_size);
+
+        // 回滚后文件仍是完整的，可以正常恢复
+        assert_eq!(fs::metadata(&path).unwrap().len(), good_size);
+        let (_log, mut restored) = AppendLog::open(&path).unwrap();
+        assert_eq!(restored.get("k"), Some("v"));
+    }
+
+    #[test]
+    fn repair_truncated_drops_incomplete_tail() {
+        let path = tmp_path("repair");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "SET\tk\t-\tv\nSET\tk2\t-\tpar").unwrap();
+        // 未修复前拒绝启动
+        assert!(matches!(AppendLog::open(&path), Err(Error::Corrupt(_))));
+
+        assert_eq!(AppendLog::repair_truncated(&path).unwrap(), 12);
+        assert_eq!(AppendLog::repair_truncated(&path).unwrap(), 0); // 幂等
+
+        // 修复后只丢弃未完成的那条，已确认的数据仍在
+        let (_log, mut store) = AppendLog::open(&path).unwrap();
+        assert_eq!(store.get("k"), Some("v"));
+        assert_eq!(store.get("k2"), None);
     }
 
     #[test]
